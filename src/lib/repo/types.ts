@@ -2,14 +2,26 @@ import type { BidDecision } from "@/lib/domain/bidding";
 import type { Minor } from "@/lib/domain/money";
 import type { PanelDefinition, PanelStatus } from "@/lib/domain/panels";
 
+/** A bid as shown in a lot's public history strip. Contact data is absent by construction. */
+export interface PublicBidEntry {
+  displayName: string;
+  /** Hostname of the bidder's supplied URL, or null. Drives the brand icon. */
+  brandDomain: string | null;
+  amountMinor: Minor;
+  createdAt: Date;
+}
+
 /** Full server-side view of a lot: catalogue definition plus live state. */
 export interface LotState {
   panel: PanelDefinition;
   status: PanelStatus;
   currentHighMinor: Minor | null;
   currentHighDisplayName: string | null;
+  currentHighDomain: string | null;
   bidCount: number;
   lastBidAt: Date | null;
+  /** Most recent live bids, newest first. Length capped by config. */
+  recentBids: PublicBidEntry[];
 }
 
 export type BidStatus = "active" | "outbid" | "accepted" | "rejected" | "withdrawn";
@@ -37,7 +49,11 @@ export interface BidRecord {
 
 export interface PlaceBidInput {
   panelId: string;
-  amountMinor: Minor;
+  /**
+   * The price the bidder was shown. The server recomputes the real next price
+   * and rejects a mismatch rather than charging whatever the price has become.
+   */
+  expectedAmountMinor: Minor;
   displayName: string;
   contactName: string;
   contactEmail: string;
@@ -53,7 +69,7 @@ export interface PlaceBidInput {
 export type PlaceBidResult =
   | { ok: true; bid: BidRecord; lot: LotState; deduplicated: boolean }
   | { ok: false; decision: Extract<BidDecision, { ok: false }> }
-  | { ok: false; decision: { code: "UNKNOWN_PANEL"; message: string; minimumMinor: 0 } };
+  | { ok: false; decision: { code: "UNKNOWN_PANEL"; message: string; nextAmountMinor: 0 } };
 
 export interface ListBidsOptions {
   panelId?: string;
@@ -81,7 +97,37 @@ export interface AuctionRepository {
   getLot(panelId: string): Promise<LotState | undefined>;
   placeBid(input: PlaceBidInput, now: Date): Promise<PlaceBidResult>;
   listBids(options: ListBidsOptions): Promise<ListBidsPage>;
-  decideBid(bidId: string, status: Extract<BidStatus, "accepted" | "rejected">): Promise<BidRecord | undefined>;
+  decideBid(
+    bidId: string,
+    status: Extract<BidStatus, "accepted" | "rejected">,
+  ): Promise<BidRecord | undefined>;
   setLotStatus(panelId: string, status: PanelStatus): Promise<LotState | undefined>;
   healthCheck(): Promise<{ ok: boolean; detail: string }>;
+}
+
+/**
+ * Hostname of a bidder-supplied URL, or null if absent or unparseable.
+ *
+ * Kept here rather than in the UI so both drivers and both serialisers derive it
+ * identically, and so a malformed URL can never reach a template. `www.` is
+ * stripped because the domain is displayed, and "www.example.com" reads as noise
+ * next to a brand name.
+ */
+export function brandDomain(brandUrl: string | null): string | null {
+  if (!brandUrl) return null;
+  try {
+    const url = new URL(brandUrl);
+
+    // `new URL` happily parses "javascript:alert(1)" and "mailto:a@b.c", both of
+    // which have an empty hostname. Returning "" there would put a value that
+    // is not a domain into a field every consumer treats as one, so anything
+    // without a real host is simply absent.
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    const host = url.hostname.toLowerCase();
+    if (host.length === 0) return null;
+
+    return host.startsWith("www.") ? host.slice(4) : host;
+  } catch {
+    return null;
+  }
 }

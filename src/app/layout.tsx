@@ -2,7 +2,8 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 const SITE_NAME = "Brand My Daytona";
-const TAGLINE = "Bid for branding space on a Triumph Daytona 675R race build.";
+const TAGLINE =
+  "Eleven sponsorship areas on a Triumph Daytona 675R race build. Every auction starts at zero.";
 
 export const metadata: Metadata = {
   title: {
@@ -22,7 +23,7 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#07080a",
+  themeColor: "#ffffff",
   width: "device-width",
   initialScale: 1,
 };

@@ -1,36 +1,38 @@
-import { type Minor, toMinor } from "./money";
-import type { PanelDefinition, PanelStatus } from "./panels";
+import { config } from "@/lib/config";
+import type { Minor } from "./money";
+import type { PanelStatus } from "./panels";
 
 /**
- * Every bidding rule lives here as a pure function of its inputs. No clock, no
- * database, no request context — which is why these rules are the only part of
- * the system that can be exhaustively unit tested, and why the API layer must
- * never re-implement a threshold of its own.
+ * Every bidding rule lives here as a pure function of its inputs. No database,
+ * no request context — which is why these rules are the only part of the system
+ * that can be exhaustively unit tested, and why the API layer must never
+ * re-implement a threshold of its own.
+ *
+ * THE MECHANIC
+ * ------------
+ * Every lot starts at zero. Each bid raises it by exactly one flat increment.
+ * A lot's price is therefore always (bid count x increment), and the next price
+ * is never ambiguous or negotiable — there is no amount field to fill in, only
+ * a price to accept.
+ *
+ * That is a deliberate trade against free-entry bidding. It gives up the jump
+ * bid (a sponsor cannot pay over the odds to lock a panel early) and buys three
+ * things worth more on a site like this: nobody can fat-finger an extra zero,
+ * the price is legible at a glance without explaining reserves or increment
+ * bands, and every bid is the same small step, so the ratchet keeps moving.
  */
 
-/** Minimum raise, tiered so low lots stay accessible and hero lots move fast. */
-const INCREMENT_BANDS: readonly { upTo: Minor; incrementMinor: Minor }[] = [
-  { upTo: toMinor(250), incrementMinor: toMinor(10) },
-  { upTo: toMinor(1_000), incrementMinor: toMinor(25) },
-  { upTo: toMinor(5_000), incrementMinor: toMinor(100) },
-  { upTo: Number.POSITIVE_INFINITY, incrementMinor: toMinor(250) },
-];
-
-export function bidIncrement(currentMinor: Minor): Minor {
-  for (const band of INCREMENT_BANDS) {
-    if (currentMinor < band.upTo) return band.incrementMinor;
-  }
-  // Unreachable: the final band is unbounded. Kept for exhaustiveness.
-  return toMinor(250);
+/** The flat step. Configured once, read from here by everything else. */
+export function bidIncrement(): Minor {
+  return config.auction.incrementMinor;
 }
 
 /**
- * The smallest amount that would be accepted right now. With no standing bid
- * this is the reserve itself, so the first bidder can take a lot at reserve.
+ * The exact price of the next bid on a lot. With no standing bid that is one
+ * increment, which is what "every auction starts at zero" means in practice.
  */
-export function minimumBid(panel: PanelDefinition, currentHighMinor: Minor | null): Minor {
-  if (currentHighMinor === null) return panel.reserveMinor;
-  return currentHighMinor + bidIncrement(currentHighMinor);
+export function nextBidAmount(currentHighMinor: Minor | null): Minor {
+  return (currentHighMinor ?? 0) + bidIncrement();
 }
 
 /**
@@ -39,10 +41,7 @@ export function minimumBid(panel: PanelDefinition, currentHighMinor: Minor | nul
  */
 export const ANTI_SNIPE_WINDOW_MS = 5 * 60 * 1000;
 
-export function extendedCloseAt(
-  scheduledCloseAt: Date,
-  lastBidAt: Date | null,
-): Date {
+export function extendedCloseAt(scheduledCloseAt: Date, lastBidAt: Date | null): Date {
   if (lastBidAt === null) return scheduledCloseAt;
   const extendedTo = lastBidAt.getTime() + ANTI_SNIPE_WINDOW_MS;
   return extendedTo > scheduledCloseAt.getTime() ? new Date(extendedTo) : scheduledCloseAt;
@@ -52,19 +51,25 @@ export type BidRejectionCode =
   | "AUCTION_NOT_OPEN"
   | "AUCTION_CLOSED"
   | "PANEL_UNAVAILABLE"
-  | "INVALID_AMOUNT"
-  | "BELOW_MINIMUM";
+  | "PRICE_MOVED";
 
 export type BidDecision =
   | { ok: true; amountMinor: Minor }
-  | { ok: false; code: BidRejectionCode; message: string; minimumMinor: Minor };
+  | { ok: false; code: BidRejectionCode; message: string; nextAmountMinor: Minor };
 
 export interface BidContext {
-  panel: PanelDefinition;
   panelStatus: PanelStatus;
   currentHighMinor: Minor | null;
   lastBidAt: Date | null;
-  amountMinor: Minor;
+  /**
+   * The price the bidder was shown when they clicked.
+   *
+   * Checked against the live price rather than trusted: without it, a bidder who
+   * loaded the page at a lower price and clicked minutes later would silently be
+   * committed to whatever the price had climbed to. If it has moved they are
+   * told the new price and asked again.
+   */
+  expectedAmountMinor: Minor;
   now: Date;
   opensAt: Date;
   closesAt: Date;
@@ -72,14 +77,14 @@ export interface BidContext {
 
 /** The single authority on whether a bid is acceptable. */
 export function evaluateBid(ctx: BidContext): BidDecision {
-  const minimumMinor = minimumBid(ctx.panel, ctx.currentHighMinor);
+  const nextAmountMinor = nextBidAmount(ctx.currentHighMinor);
 
   if (ctx.now < ctx.opensAt) {
     return {
       ok: false,
       code: "AUCTION_NOT_OPEN",
       message: "Bidding has not opened yet.",
-      minimumMinor,
+      nextAmountMinor,
     };
   }
 
@@ -88,7 +93,7 @@ export function evaluateBid(ctx: BidContext): BidDecision {
       ok: false,
       code: "AUCTION_CLOSED",
       message: "Bidding on this lot has closed.",
-      minimumMinor,
+      nextAmountMinor,
     };
   }
 
@@ -97,27 +102,24 @@ export function evaluateBid(ctx: BidContext): BidDecision {
       ok: false,
       code: "PANEL_UNAVAILABLE",
       message: `This lot is no longer accepting bids (${ctx.panelStatus}).`,
-      minimumMinor,
+      nextAmountMinor,
     };
   }
 
-  if (!Number.isInteger(ctx.amountMinor) || ctx.amountMinor <= 0) {
+  if (ctx.expectedAmountMinor !== nextAmountMinor) {
     return {
       ok: false,
-      code: "INVALID_AMOUNT",
-      message: "Bid amount must be a positive whole number of minor units.",
-      minimumMinor,
+      code: "PRICE_MOVED",
+      message: "Someone bid first. The price has moved.",
+      nextAmountMinor,
     };
   }
 
-  if (ctx.amountMinor < minimumMinor) {
-    return {
-      ok: false,
-      code: "BELOW_MINIMUM",
-      message: "Bid is below the minimum for this lot.",
-      minimumMinor,
-    };
-  }
+  return { ok: true, amountMinor: nextAmountMinor };
+}
 
-  return { ok: true, amountMinor: ctx.amountMinor };
+/** Progress toward the purchase target, clamped so the bar cannot overflow. */
+export function fundingPercent(committedMinor: Minor, targetMinor: Minor): number {
+  if (targetMinor <= 0) return 0;
+  return Math.min(100, Math.max(0, (committedMinor / targetMinor) * 100));
 }

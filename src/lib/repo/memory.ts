@@ -2,15 +2,17 @@ import { randomUUID } from "node:crypto";
 import { config } from "@/lib/config";
 import { evaluateBid } from "@/lib/domain/bidding";
 import { PANEL_CATALOGUE, findPanel, type PanelStatus } from "@/lib/domain/panels";
-import type {
-  AuctionRepository,
-  BidRecord,
-  BidStatus,
-  ListBidsOptions,
-  ListBidsPage,
-  LotState,
-  PlaceBidInput,
-  PlaceBidResult,
+import {
+  brandDomain,
+  type AuctionRepository,
+  type BidRecord,
+  type BidStatus,
+  type ListBidsOptions,
+  type ListBidsPage,
+  type LotState,
+  type PlaceBidInput,
+  type PlaceBidResult,
+  type PublicBidEntry,
 } from "./types";
 
 /**
@@ -35,31 +37,59 @@ export class MemoryAuctionRepository implements AuctionRepository {
     for (const panel of PANEL_CATALOGUE) this.lotStatus.set(panel.id, "open");
   }
 
-  private liveBidsFor(panelId: string): BidRecord[] {
+  /**
+   * Bids that still count towards a lot, highest first, ties broken in favour
+   * of the earlier bid.
+   *
+   * "Outbid" counts. A lot's price is (bid count x increment), so dropping
+   * superseded bids would make the count disagree with the price. It also keeps
+   * this driver's filter identical to the Postgres one — a divergence here
+   * would make the two drivers answer differently for the same data, which is
+   * exactly what the shared test suite exists to prevent.
+   */
+  private countedBidsFor(panelId: string): BidRecord[] {
     return this.bids
-      .filter((b) => b.panelId === panelId && (b.status === "active" || b.status === "accepted"))
+      .filter(
+        (b) =>
+          b.panelId === panelId &&
+          (b.status === "active" || b.status === "outbid" || b.status === "accepted"),
+      )
       .sort(
-        (a, b) =>
-          b.amountMinor - a.amountMinor || a.createdAt.getTime() - b.createdAt.getTime(),
+        (a, b) => b.amountMinor - a.amountMinor || a.createdAt.getTime() - b.createdAt.getTime(),
       );
+  }
+
+  private static toEntry(bid: BidRecord): PublicBidEntry {
+    return {
+      displayName: bid.displayName,
+      brandDomain: brandDomain(bid.brandUrl),
+      amountMinor: bid.amountMinor,
+      createdAt: bid.createdAt,
+    };
   }
 
   private buildLot(panelId: string): LotState | undefined {
     const panel = findPanel(panelId);
     if (!panel) return undefined;
-    const live = this.liveBidsFor(panelId);
-    const top = live[0];
-    const lastBidAt = live.reduce<Date | null>(
+
+    const counted = this.countedBidsFor(panelId);
+    const top = counted[0];
+    const lastBidAt = counted.reduce<Date | null>(
       (latest, b) => (latest === null || b.createdAt > latest ? b.createdAt : latest),
       null,
     );
+
     return {
       panel,
       status: this.lotStatus.get(panelId) ?? "open",
       currentHighMinor: top?.amountMinor ?? null,
       currentHighDisplayName: top?.displayName ?? null,
-      bidCount: live.length,
+      currentHighDomain: top ? brandDomain(top.brandUrl) : null,
+      bidCount: counted.length,
       lastBidAt,
+      recentBids: counted
+        .slice(0, config.auction.historyLength)
+        .map(MemoryAuctionRepository.toEntry),
     };
   }
 
@@ -85,30 +115,29 @@ export class MemoryAuctionRepository implements AuctionRepository {
     if (!lot) {
       return {
         ok: false,
-        decision: { code: "UNKNOWN_PANEL", message: "Unknown lot.", minimumMinor: 0 },
+        decision: { code: "UNKNOWN_PANEL", message: "Unknown lot.", nextAmountMinor: 0 },
       };
     }
 
     const decision = evaluateBid({
-      panel: lot.panel,
       panelStatus: lot.status,
       currentHighMinor: lot.currentHighMinor,
       lastBidAt: lot.lastBidAt,
-      amountMinor: input.amountMinor,
+      expectedAmountMinor: input.expectedAmountMinor,
       now,
       opensAt: config.auction.opensAt,
       closesAt: config.auction.closesAt,
     });
     if (!decision.ok) return { ok: false, decision };
 
-    for (const previous of this.liveBidsFor(input.panelId)) {
+    for (const previous of this.countedBidsFor(input.panelId)) {
       if (previous.status === "active") previous.status = "outbid";
     }
 
     const bid: BidRecord = {
       id: randomUUID(),
       panelId: input.panelId,
-      amountMinor: input.amountMinor,
+      amountMinor: decision.amountMinor,
       displayName: input.displayName,
       contactName: input.contactName,
       contactEmail: input.contactEmail,

@@ -1,11 +1,17 @@
-import { type Minor, toMinor } from "./money";
-
 /**
- * Commercial tier of a surface. Tier drives reserve price and the order lots
- * are presented in; it is deliberately coarse so the catalogue stays legible.
+ * The lot catalogue for the Daytona 675R race build.
+ *
+ * Eleven surfaces, presented in descending order of visibility, because the
+ * ordering *is* the pricing signal: there are no per-lot reserves. Every lot
+ * starts at zero and rises by one flat increment per bid, so what a surface is
+ * worth is discovered entirely by competition. Position 01 is the panel the
+ * camera cannot avoid.
+ *
+ * Areas are the usable flat print area on OEM bodywork, not the full panel
+ * dimension — curvature and mounting hardware eat roughly 15% of every surface.
+ * Where a lot covers both flanks it is sold as a matched pair and the area is
+ * the combined figure.
  */
-export type PanelTier = "hero" | "premium" | "standard";
-
 export type PanelStatus = "open" | "reserved" | "sold" | "withdrawn";
 
 /**
@@ -16,207 +22,38 @@ export type PanelStatus = "open" | "reserved" | "sold" | "withdrawn";
 export interface PanelDefinition {
   id: string;
   name: string;
-  location: string;
-  tier: PanelTier;
-  /** Usable print area in square centimetres, measured on the fairing. */
+  /** One line on why this surface is worth having. Shown under the name. */
+  descriptor: string;
+  /** Usable print area in square centimetres. */
   areaCm2: number;
-  reserveMinor: Minor;
-  /** Shown on the lot card so a bidder knows what they are actually buying. */
-  notes: string;
+  /** True when the lot covers both flanks as a matched pair. */
+  bothSides: boolean;
   sortOrder: number;
 }
 
 function panel(
   id: string,
   name: string,
-  location: string,
-  tier: PanelTier,
+  descriptor: string,
   areaCm2: number,
-  reserveMajor: number,
-  notes: string,
+  bothSides: boolean,
   sortOrder: number,
 ): PanelDefinition {
-  return {
-    id,
-    name,
-    location,
-    tier,
-    areaCm2,
-    reserveMinor: toMinor(reserveMajor),
-    notes,
-    sortOrder,
-  };
+  return { id, name, descriptor, areaCm2, bothSides, sortOrder };
 }
 
-/**
- * The lot catalogue for the Daytona 675R race build.
- *
- * Areas are the usable flat print area on OEM bodywork, not the full panel
- * dimension — curvature and mounting hardware eat roughly 15% of every surface.
- * Reserves are set by visibility: on-camera front three-quarter shots dominate
- * broadcast and social, so the upper fairing and belly pan carry the premium.
- */
 export const PANEL_CATALOGUE: readonly PanelDefinition[] = [
-  panel(
-    "upper-fairing-left",
-    "Upper Fairing — Left",
-    "Left flank, above the belly pan",
-    "hero",
-    620,
-    900,
-    "The headline surface. Visible in every left-hand corner shot and paddock photo.",
-    10,
-  ),
-  panel(
-    "upper-fairing-right",
-    "Upper Fairing — Right",
-    "Right flank, above the belly pan",
-    "hero",
-    620,
-    900,
-    "Mirror of the left hero panel. Faces the camera on right-hand apexes.",
-    20,
-  ),
-  panel(
-    "nose-number-board",
-    "Nose Number Board",
-    "Front fairing, above the headlight blank",
-    "hero",
-    300,
-    750,
-    "Head-on shots and grid line-ups. Shares the panel with the race number.",
-    30,
-  ),
-  panel(
-    "belly-pan-left",
-    "Belly Pan — Left",
-    "Lower left fairing, below the frame rail",
-    "premium",
-    480,
-    520,
-    "Low and long. Reads cleanly at speed and in trackside panning shots.",
-    40,
-  ),
-  panel(
-    "belly-pan-right",
-    "Belly Pan — Right",
-    "Lower right fairing, below the frame rail",
-    "premium",
-    480,
-    520,
-    "Mirror of the left belly pan.",
-    50,
-  ),
-  panel(
-    "seat-cowl-left",
-    "Seat Cowl — Left",
-    "Tail unit, left side",
-    "premium",
-    340,
-    420,
-    "Rear three-quarter and following-camera angles.",
-    60,
-  ),
-  panel(
-    "seat-cowl-right",
-    "Seat Cowl — Right",
-    "Tail unit, right side",
-    "premium",
-    340,
-    420,
-    "Mirror of the left seat cowl.",
-    70,
-  ),
-  panel(
-    "tank-left",
-    "Tank — Left",
-    "Fuel tank, left shoulder",
-    "premium",
-    260,
-    380,
-    "Rider-eye and pit-lane detail shots. Partly covered when the rider is tucked.",
-    80,
-  ),
-  panel(
-    "tank-right",
-    "Tank — Right",
-    "Fuel tank, right shoulder",
-    "premium",
-    260,
-    380,
-    "Mirror of the left tank panel.",
-    90,
-  ),
-  panel(
-    "front-fender",
-    "Front Fender",
-    "Front mudguard, both sides",
-    "standard",
-    180,
-    260,
-    "Sold as a matched pair of decals, one per side.",
-    100,
-  ),
-  panel(
-    "windscreen-strip",
-    "Windscreen Strip",
-    "Double-bubble screen, upper edge",
-    "standard",
-    150,
-    240,
-    "Classic race-screen banner. Applied to the inside face so it survives cleaning.",
-    110,
-  ),
-  panel(
-    "swingarm-left",
-    "Swingarm — Left",
-    "Left swingarm spar",
-    "standard",
-    220,
-    200,
-    "Narrow and long. Best suited to a wordmark rather than a full logo.",
-    120,
-  ),
-  panel(
-    "swingarm-right",
-    "Swingarm — Right",
-    "Right swingarm spar",
-    "standard",
-    220,
-    200,
-    "Mirror of the left swingarm.",
-    130,
-  ),
-  panel(
-    "tail-hugger",
-    "Rear Hugger",
-    "Rear wheel hugger",
-    "standard",
-    120,
-    140,
-    "Small surface, high frequency in rear-wheel action shots.",
-    140,
-  ),
-  panel(
-    "fork-lowers",
-    "Fork Lowers",
-    "Ohlins NIX30 fork sliders",
-    "standard",
-    90,
-    160,
-    "Sold as a pair. The gold fork is one of the 675R's signature details.",
-    150,
-  ),
-  panel(
-    "wheel-rims",
-    "Wheel Rim Decals",
-    "Both rims, inner lip",
-    "standard",
-    110,
-    150,
-    "Sold as a full set of four arcs. Very high visibility in motion.",
-    160,
-  ),
+  panel("upper-fairing-left", "Upper fairing — left", "The headline placement", 620, false, 1),
+  panel("upper-fairing-right", "Upper fairing — right", "Full side visibility", 620, false, 2),
+  panel("nose-number-board", "Nose number board", "Front and centre", 300, false, 3),
+  panel("belly-pan-left", "Belly pan — left", "Low and forward", 480, false, 4),
+  panel("belly-pan-right", "Belly pan — right", "The return side", 480, false, 5),
+  panel("seat-cowl", "Seat cowl", "The chasing view", 680, true, 6),
+  panel("fuel-tank", "Fuel tank", "Rider's eye and pit lane", 520, true, 7),
+  panel("swingarm", "Swingarm", "Long, low and unmissable", 440, true, 8),
+  panel("front-fender", "Front fender", "Leads every frame", 180, true, 9),
+  panel("windscreen-strip", "Windscreen strip", "The classic race banner", 150, false, 10),
+  panel("wheel-rims", "Wheel rim decals", "Spins in every action shot", 110, true, 11),
 ];
 
 const BY_ID = new Map(PANEL_CATALOGUE.map((p) => [p.id, p]));
@@ -225,14 +62,5 @@ export function findPanel(id: string): PanelDefinition | undefined {
   return BY_ID.get(id);
 }
 
-export const TIER_LABEL: Record<PanelTier, string> = {
-  hero: "Hero",
-  premium: "Premium",
-  standard: "Standard",
-};
-
-/** Sum of all reserves — the floor the build needs the auction to clear. */
-export const TOTAL_RESERVE_MINOR: Minor = PANEL_CATALOGUE.reduce(
-  (sum, p) => sum + p.reserveMinor,
-  0,
-);
+/** Combined print area across every lot, for the headline stat. */
+export const TOTAL_AREA_CM2 = PANEL_CATALOGUE.reduce((sum, p) => sum + p.areaCm2, 0);

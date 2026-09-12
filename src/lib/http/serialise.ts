@@ -1,27 +1,44 @@
-import { minimumBid } from "@/lib/domain/bidding";
-import type { BidRecord, LotState } from "@/lib/repo/types";
-import { TIER_LABEL } from "@/lib/domain/panels";
+import { nextBidAmount } from "@/lib/domain/bidding";
+import type { BidRecord, LotState, PublicBidEntry } from "@/lib/repo/types";
+import { brandDomain } from "@/lib/repo/types";
+
+/** One row of a lot's public bid history. */
+export interface PublicBid {
+  displayName: string;
+  brandDomain: string | null;
+  amountMinor: number;
+  createdAt: string;
+}
 
 /**
  * Public wire format for a lot. Note what is absent: no bidder email, name,
- * phone, IP hash or user agent. The only identity exposed is `displayName`,
- * which the bidder chose knowing it would be published.
+ * phone, IP hash or user agent. The only identity exposed is `displayName` and
+ * the hostname of a URL the bidder chose to publish.
  */
 export interface PublicLot {
   id: string;
   name: string;
-  location: string;
-  tier: string;
-  tierLabel: string;
+  descriptor: string;
   areaCm2: number;
-  reserveMinor: number;
-  notes: string;
+  bothSides: boolean;
   status: LotState["status"];
   currentHighMinor: number | null;
   currentHighDisplayName: string | null;
-  minimumBidMinor: number;
+  currentHighDomain: string | null;
+  /** Exact price of the next bid. There is no amount to choose. */
+  nextBidMinor: number;
   bidCount: number;
   lastBidAt: string | null;
+  recentBids: PublicBid[];
+}
+
+function toPublicBid(entry: PublicBidEntry): PublicBid {
+  return {
+    displayName: entry.displayName,
+    brandDomain: entry.brandDomain,
+    amountMinor: entry.amountMinor,
+    createdAt: entry.createdAt.toISOString(),
+  };
 }
 
 /**
@@ -35,18 +52,17 @@ export function toPublicLot(lot: LotState): PublicLot {
   return {
     id: lot.panel.id,
     name: lot.panel.name,
-    location: lot.panel.location,
-    tier: lot.panel.tier,
-    tierLabel: TIER_LABEL[lot.panel.tier],
+    descriptor: lot.panel.descriptor,
     areaCm2: lot.panel.areaCm2,
-    reserveMinor: lot.panel.reserveMinor,
-    notes: lot.panel.notes,
+    bothSides: lot.panel.bothSides,
     status: lot.status,
     currentHighMinor: lot.currentHighMinor,
     currentHighDisplayName: lot.currentHighDisplayName,
-    minimumBidMinor: minimumBid(lot.panel, lot.currentHighMinor),
+    currentHighDomain: lot.currentHighDomain,
+    nextBidMinor: nextBidAmount(lot.currentHighMinor),
     bidCount: lot.bidCount,
     lastBidAt: lot.lastBidAt ? lot.lastBidAt.toISOString() : null,
+    recentBids: lot.recentBids.map(toPublicBid),
   };
 }
 
@@ -56,6 +72,7 @@ export interface PublicBidReceipt {
   panelId: string;
   amountMinor: number;
   displayName: string;
+  brandDomain: string | null;
   status: BidRecord["status"];
   createdAt: string;
 }
@@ -66,6 +83,7 @@ export function toPublicBidReceipt(bid: BidRecord): PublicBidReceipt {
     panelId: bid.panelId,
     amountMinor: bid.amountMinor,
     displayName: bid.displayName,
+    brandDomain: brandDomain(bid.brandUrl),
     status: bid.status,
     createdAt: bid.createdAt.toISOString(),
   };

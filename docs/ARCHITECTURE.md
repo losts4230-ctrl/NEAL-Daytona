@@ -1,8 +1,9 @@
 # Architecture review — Brand My Daytona
 
 A sponsorship auction where bidders bid, per panel, for branding space on a
-Triumph Daytona 675R that **has not been bought yet**. The auction is what funds
-the purchase.
+Triumph Daytona 675R that **has not been bought yet**. Eleven surfaces, each its
+own auction, every one starting at zero. The auction is what funds the
+INR 10,00,000 purchase target, and a funding bar in the hero says so.
 
 This document is the design record: what was built, what was deliberately left
 out, and what has to change before each next step. It is written to be read by
@@ -98,40 +99,66 @@ minutes of an auction is exactly the failure this rule prevents.
 
 Two things stay out of the database on purpose:
 
-- **The lot catalogue** (`domain/panels.ts`) is code. Name, print area, reserve
-  and tier are product decisions that should move through review with a diff,
-  not be edited in a database console at 11pm. The database holds only the
-  mutable `status`.
+- **The lot catalogue** (`domain/panels.ts`) is code. Name, print area,
+  descriptor and presentation order are product decisions that should move
+  through review with a diff, not be edited in a database console at 11pm. The
+  database holds only the mutable `status`. Order matters more than usual here:
+  with no reserves, the ordering *is* the pricing signal.
 - **Money** is always an integer count of minor units. `formatMoney` is the only
   place a value becomes a string.
 
 ---
 
-## 3. Auction correctness
+## 3. The pricing mechanic
 
-The two hard problems in any auction are the same two problems:
+**Every lot starts at zero and each bid raises it by exactly one flat
+increment.** A lot's price is always `bid count x increment`, so 23 bids at
+INR 5,000 is INR 1,15,000 and nothing else. Reserves and increment bands were
+both considered and dropped.
+
+| | Flat ratchet (chosen) | Free-entry bidding with reserves |
+|---|---|---|
+| Bidder input | A price to accept. No number to type | An amount field |
+| Worst failure | Bidding one increment too early | An extra zero, committed |
+| Explaining it | One sentence in the hero | Reserves, minimum increments, bands |
+| Jump bids | Impossible | Possible — a sponsor can lock a panel early |
+| Momentum | Every bid is the same small step | Stalls once the leader is far ahead |
+
+The cost is real: a sponsor who badly wants the hero panel cannot simply pay
+over the odds for it. What that buys is a price nobody can misread and a form
+with no way to fat-finger a commitment, which on a public, shareable site is
+the better trade.
+
+`PURCHASE_TARGET / BID_INCREMENT` is the number of bids the auction needs to
+hit target — 200 at the defaults. That ratio, not the increment on its own, is
+the thing to reason about when changing either.
 
 ### Concurrent bids on one lot
 
-Read-the-high-bid then write-a-higher-one is a lost-update race. Two bidders
-read £900, both bid £925, both are told they lead.
+Read-the-price then write-a-higher-one is a lost-update race: two bidders read
+INR 70,000, both bid INR 75,000, both are told they lead.
 
 `PostgresAuctionRepository.placeBid` opens a transaction, takes
-`SELECT ... FOR UPDATE` on the lot row **before** reading the standing high bid,
-and inserts inside the same transaction. Bids on the same lot serialise; bids on
-different lots do not contend at all, since the lock is per lot.
+`SELECT ... FOR UPDATE` on the lot row **before** reading the standing high
+bid, and inserts inside the same transaction. Bids on the same lot serialise;
+bids on different lots do not contend at all, since the lock is per lot.
 
 The memory driver relies on Node's single-threaded event loop: there is no
 `await` between its read and its write. `memory.test.ts` fires twelve
-simultaneous identical bids and asserts exactly one wins.
+simultaneous identical bids and asserts exactly one wins **and that the other
+eleven are told the price moved** — not silently accepted at the same number.
 
-### Duplicate submissions
+### The price the bidder saw
 
-A double-clicked button or a retried request after a timeout must not create two
-bids. The client generates an idempotency key per attempt-series; a successful
-bid records it in `bid_requests`. A replay returns the original bid with HTTP 200
-instead of 201. A *failed* attempt records nothing, so raising a rejected bid
-correctly creates a new one.
+A bid carries `expectedAmountMinor`: the price on the button when they clicked.
+The server recomputes the real next price and rejects a mismatch with
+`PRICE_MOVED` and the live figure, which the dialog re-offers.
+
+This is optimistic concurrency, and it cuts both ways on purpose. It stops a
+bidder who loaded the page an hour ago being quietly committed to a price that
+has since climbed — and it stops a tampered or fat-fingered payload buying a
+lot at a number the server never quoted. **The amount written to the ledger is
+always the server's, never the client's.**
 
 ### Sniping
 
@@ -143,10 +170,15 @@ bidder rather than whoever had the best connection.
 ### Auditability
 
 `bids` is append-only. Nothing is ever rewritten except `status`
-(`active` → `outbid` / `accepted` / `rejected`). The full history of an auction
-is reconstructable, which is what settles a dispute about who bid what and when.
+(`active` -> `outbid` / `accepted` / `rejected`). Superseded bids still count
+towards a lot's price and stay in its public history, because on a ratchet the
+price only means something if you can see the climb that produced it.
 
----
+Both drivers filter on the same statuses (`active`, `outbid`, `accepted`) for
+price, count and history. That was a real bug during the build: the memory
+driver excluded `outbid` from the current-high calculation while Postgres
+included it, so the two could answer differently for identical data. The shared
+test file is what the drivers are now held to.
 
 ## 4. Security review
 
@@ -165,6 +197,8 @@ is reconstructable, which is what settles a dispute about who bid what and when.
 | Admin auth | Bearer token compared with `timingSafeEqual`; fails closed if unset |
 | Secrets | Environment only; `.env*` gitignored; `.env.example` carries no values |
 | Error leakage | Internal errors are logged and answered with a generic message |
+| Third-party leakage | Bidder site icons are proxied through `/api/v1/brand-icon`, so `img-src 'self'` holds and no visitor is disclosed to a favicon service |
+| URL handling | `brandUrl` is restricted to http(s); stored values can never be a `javascript:` URL |
 
 Two details worth their own note, because both were bugs during the build:
 
@@ -178,6 +212,18 @@ Two details worth their own note, because both were bugs during the build:
   `website` field* — handing a bot the exact information the trap exists to
   withhold. The schema now accepts any string and the route handler rejects a
   non-empty value with the same generic error as any other failure.
+- **`new URL` is not a scheme check.** Zod's `.url()` only asks whether
+  `new URL` parses the value, and it parses `javascript:alert(1)` quite
+  happily — with an empty hostname. That let a script URL into stored data,
+  and made `brandDomain` return `""` for a field every consumer treats as a
+  hostname. Both layers now reject anything that is not http(s).
+- **The icon proxy fetches from exactly one host.** The bidder-supplied value
+  is a *query parameter* to a fixed URL, and it is validated against a strict
+  hostname pattern before it is used, so `localhost`, `127.0.0.1`,
+  `169.254.169.254` and full URLs are all refused rather than sanitised. An
+  unresolvable domain returns a generated monogram, which means the endpoint
+  also works with no outbound network access at all — and the layout is
+  identical either way, so there is no broken-image state.
 
 ### Known limitations, accepted for launch
 
@@ -226,7 +272,8 @@ The read path is what matters, and it is designed around that asymmetry.
 
 | Concern | Design | Headroom |
 |---|---|---|
-| Board reads | **One** SQL query for all lots. A `LEFT JOIN LATERAL` with window functions returns the top bid, the bid count and the last-bid time per lot in a single pass, on the `(panel_id, amount_minor DESC, created_at ASC)` index | The obvious N+1 — one query per lot — is the thing this explicitly avoids |
+| Board reads | **Two** SQL queries for the whole board, whatever the lot count: a `LEFT JOIN LATERAL` aggregate for price/count/last-bid, and one `row_number()` top-N-per-group for every lot's history strip | The obvious N+1 — one history query per lot on the most-requested endpoint — is the thing this explicitly avoids |
+| Brand icons | Proxied and cached for 7 days at the edge, 1 day in the browser | One upstream fetch per domain per week, not per page view |
 | Traffic spikes | `s-maxage=5, stale-while-revalidate=25` on `/api/v1/lots` | Origin reads stay near-constant regardless of concurrent viewers |
 | Live updates | 20s polling, paused on hidden tabs | No connection state; SSE is the upgrade if sub-second latency is ever wanted |
 | Connections | Pool capped at `max: 5`, `prepare: false` for transaction-mode poolers | A pooled endpoint (pgbouncer / Neon pooler / RDS Proxy) is **required** on serverless |
@@ -282,7 +329,8 @@ an async receipt — not a bigger database.
 | Bike is never bought | Medium | Reputational | Void condition stated in four places; no money taken, so nothing to refund |
 | Winning bidder does not pay | Medium | Low per lot | Written confirmation and invoice before vinyl is applied; re-offer to the next bidder |
 | Fake or abusive bids inflate the board | Medium | Medium | Rate limit, honeypot, operator reject. **Email verification is the real fix and is not built** |
-| Reserves are wrong | Medium | Medium | Reserves are code; a repriced lot is a reviewed one-line diff |
+| Auction stalls well short of target | Medium | High | `PURCHASE_TARGET / BID_INCREMENT` is 200 bids at the defaults; the increment is one env var, and the funding bar makes a stall visible early |
+| A lot sells far under its worth | Medium | Low | No jump bids means no way to pay over the odds; the anti-snipe extension is what stops a cheap last-second steal |
 | Trademark complaint over "Triumph"/"Daytona" | Low | Medium | Nominative descriptive use only, with a disclaimer in the footer; no Triumph logos or livery |
 | Terms are unenforceable | Medium | Medium | `app/terms/page.tsx` is written to match actual behaviour but is **not legal advice** — have it reviewed |
 | Memory driver in production | Low | High | Startup warning, health warning, on-page banner |
@@ -317,4 +365,14 @@ Stated plainly, because pretending they are settled would be worse:
 - **The lot catalogue in code** means a price change needs a deploy. That is a
   deliberate choice in favour of reviewability, and it is the wrong choice the
   moment a non-technical operator needs to reprice lots themselves.
-- **No pagination on the public board.** Fine at 16 lots, wrong at 200.
+- **No pagination on the public board.** Fine at 11 lots, wrong at 200. The
+  history strips make each row heavier, so that ceiling is lower than it looks.
+- **The flat ratchet caps the upside.** A sponsor who would have paid
+  INR 2,00,000 for the hero fairing has to get there one INR 5,000 step at a
+  time, and may simply not bother. If the hero lots stall while attracting
+  obvious interest, a "buy it now" price per lot is the smaller change; free-entry
+  bidding is the larger one.
+- **Publishing bidder domains is a judgement call.** It is most of the appeal of
+  sponsoring something publicly, and it is also permanent — a bid stays in that
+  lot's history after being outbid. The terms say so explicitly; some bidders
+  will still be surprised.

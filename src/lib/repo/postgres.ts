@@ -5,19 +5,21 @@ import { config } from "@/lib/config";
 import { evaluateBid } from "@/lib/domain/bidding";
 import { PANEL_CATALOGUE, findPanel, type PanelStatus } from "@/lib/domain/panels";
 import { bidRequests, bids, lots } from "@/lib/db/schema";
-import type {
-  AuctionRepository,
-  BidRecord,
-  BidStatus,
-  ListBidsOptions,
-  ListBidsPage,
-  LotState,
-  PlaceBidInput,
-  PlaceBidResult,
+import {
+  brandDomain,
+  type AuctionRepository,
+  type BidRecord,
+  type BidStatus,
+  type ListBidsOptions,
+  type ListBidsPage,
+  type LotState,
+  type PlaceBidInput,
+  type PlaceBidResult,
+  type PublicBidEntry,
 } from "./types";
 
-/** Statuses that count towards a lot's standing high bid. */
-const LIVE_BID_STATUSES = ["active", "accepted"] as const;
+/** Bid statuses that still count towards a lot's price and history. */
+const COUNTED = sql`('active', 'outbid', 'accepted')`;
 
 type Db = PostgresJsDatabase<Record<string, never>>;
 
@@ -27,8 +29,17 @@ interface LotAggregateRow extends Record<string, unknown> {
   status: PanelStatus;
   high_amount_minor: number | null;
   high_display_name: string | null;
+  high_brand_url: string | null;
   bid_count: number;
   last_bid_at: Date | null;
+}
+
+interface HistoryRow extends Record<string, unknown> {
+  panel_id: string;
+  display_name: string;
+  brand_url: string | null;
+  amount_minor: number;
+  created_at: Date;
 }
 
 /**
@@ -36,13 +47,13 @@ interface LotAggregateRow extends Record<string, unknown> {
  *
  * Two properties matter here and are worth the extra care:
  *
- *  1. The public board is served by ONE query for all lots. A per-lot follow-up
- *     query would be an N+1 that scales with the size of the catalogue on the
- *     single most-requested endpoint on the site.
+ *  1. The public board is served by TWO queries total, regardless of how many
+ *     lots exist: one aggregate and one for every lot's bid history. Fetching
+ *     history per lot would be an N+1 on the single most-requested endpoint.
  *  2. `placeBid` takes a row lock on the lot before reading the standing high
  *     bid, so concurrent bids on the same lot serialise. Without the lock, two
- *     bidders can read the same high bid and both be accepted at the same
- *     amount — the classic lost-update race, and an auction-integrity failure.
+ *     bidders can read the same price and both be accepted at it — the classic
+ *     lost-update race, and an auction-integrity failure.
  */
 export class PostgresAuctionRepository implements AuctionRepository {
   readonly driver = "postgres" as const;
@@ -55,8 +66,8 @@ export class PostgresAuctionRepository implements AuctionRepository {
      * (panel_id, amount_minor desc, created_at asc) index, so this stays an
      * index scan rather than aggregating the whole bid ledger. The window
      * functions inside the lateral are computed over the full matching set
-     * before LIMIT 1, which is what lets one pass return the top bid, the bid
-     * count and the most recent bid time together.
+     * before LIMIT 1, which lets one pass return the top bid, the bid count and
+     * the most recent bid time together.
      */
     const rows = await this.db.execute<LotAggregateRow>(sql`
       select
@@ -64,6 +75,7 @@ export class PostgresAuctionRepository implements AuctionRepository {
         l.status,
         b.amount_minor  as high_amount_minor,
         b.display_name  as high_display_name,
+        b.brand_url     as high_brand_url,
         coalesce(b.bid_count, 0)::int as bid_count,
         b.last_bid_at
       from ${lots} l
@@ -71,11 +83,12 @@ export class PostgresAuctionRepository implements AuctionRepository {
         select
           amount_minor,
           display_name,
-          count(*) over ()          as bid_count,
-          max(created_at) over ()   as last_bid_at
+          brand_url,
+          count(*) over ()        as bid_count,
+          max(created_at) over () as last_bid_at
         from ${bids}
         where panel_id = l.panel_id
-          and status in ('active', 'accepted')
+          and status in ${COUNTED}
         order by amount_minor desc, created_at asc
         limit 1
       ) b on true
@@ -84,7 +97,53 @@ export class PostgresAuctionRepository implements AuctionRepository {
     return rows as unknown as LotAggregateRow[];
   }
 
-  private static toLotState(row: LotAggregateRow): LotState | undefined {
+  /**
+   * Top N bids for every lot in one query.
+   *
+   * `row_number()` partitioned by lot then filtered in an outer query is the
+   * standard top-N-per-group form, and it is why the history strips cost one
+   * round trip for the whole board instead of one per lot.
+   */
+  private async history(panelId?: string): Promise<Map<string, PublicBidEntry[]>> {
+    const rows = (await this.db.execute<HistoryRow>(sql`
+      select panel_id, display_name, brand_url, amount_minor, created_at
+      from (
+        select
+          panel_id,
+          display_name,
+          brand_url,
+          amount_minor,
+          created_at,
+          row_number() over (
+            partition by panel_id
+            order by amount_minor desc, created_at asc
+          ) as rank
+        from ${bids}
+        where status in ${COUNTED}
+          ${panelId ? sql`and panel_id = ${panelId}` : sql``}
+      ) ranked
+      where rank <= ${config.auction.historyLength}
+      order by panel_id, amount_minor desc
+    `)) as unknown as HistoryRow[];
+
+    const byPanel = new Map<string, PublicBidEntry[]>();
+    for (const row of rows) {
+      const entries = byPanel.get(row.panel_id) ?? [];
+      entries.push({
+        displayName: row.display_name,
+        brandDomain: brandDomain(row.brand_url),
+        amountMinor: Number(row.amount_minor),
+        createdAt: new Date(row.created_at),
+      });
+      byPanel.set(row.panel_id, entries);
+    }
+    return byPanel;
+  }
+
+  private static toLotState(
+    row: LotAggregateRow,
+    recentBids: PublicBidEntry[],
+  ): LotState | undefined {
     const panel = findPanel(row.panel_id);
     if (!panel) return undefined; // A retired catalogue entry; not surfaced.
     return {
@@ -92,47 +151,52 @@ export class PostgresAuctionRepository implements AuctionRepository {
       status: row.status,
       currentHighMinor: row.high_amount_minor ?? null,
       currentHighDisplayName: row.high_display_name ?? null,
+      currentHighDomain: brandDomain(row.high_brand_url ?? null),
       bidCount: Number(row.bid_count ?? 0),
       lastBidAt: row.last_bid_at ? new Date(row.last_bid_at) : null,
+      recentBids,
+    };
+  }
+
+  /** A lot with no rows yet still renders, at the opening price. */
+  private static emptyLot(panelId: string): LotState | undefined {
+    const panel = findPanel(panelId);
+    if (!panel) return undefined;
+    return {
+      panel,
+      status: "open",
+      currentHighMinor: null,
+      currentHighDisplayName: null,
+      currentHighDomain: null,
+      bidCount: 0,
+      lastBidAt: null,
+      recentBids: [],
     };
   }
 
   async listLots(): Promise<LotState[]> {
-    const rows = await this.aggregate();
+    const [rows, historyByPanel] = await Promise.all([this.aggregate(), this.history()]);
     const byId = new Map(rows.map((r) => [r.panel_id, r]));
-    // The catalogue drives order and completeness: a lot with no row yet still
-    // renders, at reserve, rather than silently vanishing from the board.
+
+    // The catalogue drives order and completeness, so a lot with no database
+    // row yet still appears on the board rather than silently vanishing.
     return PANEL_CATALOGUE.map((panel) => {
       const row = byId.get(panel.id);
       return row
-        ? PostgresAuctionRepository.toLotState(row)
-        : ({
-            panel,
-            status: "open",
-            currentHighMinor: null,
-            currentHighDisplayName: null,
-            bidCount: 0,
-            lastBidAt: null,
-          } satisfies LotState);
+        ? PostgresAuctionRepository.toLotState(row, historyByPanel.get(panel.id) ?? [])
+        : PostgresAuctionRepository.emptyLot(panel.id);
     }).filter((l): l is LotState => l !== undefined);
   }
 
   async getLot(panelId: string): Promise<LotState | undefined> {
-    const panel = findPanel(panelId);
-    if (!panel) return undefined;
-    const rows = await this.aggregate(panelId);
+    if (!findPanel(panelId)) return undefined;
+    const [rows, historyByPanel] = await Promise.all([
+      this.aggregate(panelId),
+      this.history(panelId),
+    ]);
     const row = rows[0];
-    if (!row) {
-      return {
-        panel,
-        status: "open",
-        currentHighMinor: null,
-        currentHighDisplayName: null,
-        bidCount: 0,
-        lastBidAt: null,
-      };
-    }
-    return PostgresAuctionRepository.toLotState(row);
+    if (!row) return PostgresAuctionRepository.emptyLot(panelId);
+    return PostgresAuctionRepository.toLotState(row, historyByPanel.get(panelId) ?? []);
   }
 
   async placeBid(input: PlaceBidInput, now: Date): Promise<PlaceBidResult> {
@@ -140,11 +204,11 @@ export class PostgresAuctionRepository implements AuctionRepository {
     if (!panel) {
       return {
         ok: false,
-        decision: { code: "UNKNOWN_PANEL", message: "Unknown lot.", minimumMinor: 0 },
+        decision: { code: "UNKNOWN_PANEL", message: "Unknown lot.", nextAmountMinor: 0 },
       };
     }
 
-    return this.db.transaction(async (tx) => {
+    const inserted = await this.db.transaction(async (tx) => {
       const replay = await tx
         .select({ bidId: bidRequests.bidId })
         .from(bidRequests)
@@ -154,22 +218,18 @@ export class PostgresAuctionRepository implements AuctionRepository {
       const replayed = replay[0];
       if (replayed) {
         const [bid] = await tx.select().from(bids).where(eq(bids.id, replayed.bidId)).limit(1);
-        const lot = await this.getLot(input.panelId);
-        if (bid && lot) {
-          return { ok: true as const, bid: toBidRecord(bid), lot, deduplicated: true };
-        }
+        if (bid) return { kind: "replay" as const, bid: toBidRecord(bid) };
       }
 
       // Materialise the lot row if this is its first bid, then lock it. The
       // lock is what serialises concurrent bidders on the same lot.
       await tx.insert(lots).values({ panelId: input.panelId }).onConflictDoNothing();
-      const lockedRows = await tx.execute<{ status: PanelStatus }>(
+      const lockedRows = (await tx.execute<{ status: PanelStatus }>(
         sql`select status from ${lots} where panel_id = ${input.panelId} for update`,
-      );
-      const locked = (lockedRows as unknown as { status: PanelStatus }[])[0];
-      const lotStatus: PanelStatus = locked?.status ?? "open";
+      )) as unknown as { status: PanelStatus }[];
+      const lotStatus: PanelStatus = lockedRows[0]?.status ?? "open";
 
-      const standingRows = await tx.execute<{
+      const standingRows = (await tx.execute<{
         amount_minor: number;
         last_bid_at: Date | null;
       }>(sql`
@@ -178,36 +238,33 @@ export class PostgresAuctionRepository implements AuctionRepository {
           max(created_at) over () as last_bid_at
         from ${bids}
         where panel_id = ${input.panelId}
-          and status in ('active', 'accepted')
+          and status in ${COUNTED}
         order by amount_minor desc, created_at asc
         limit 1
-      `);
-      const standing = (
-        standingRows as unknown as { amount_minor: number; last_bid_at: Date | null }[]
-      )[0];
+      `)) as unknown as { amount_minor: number; last_bid_at: Date | null }[];
+      const standing = standingRows[0];
 
       const decision = evaluateBid({
-        panel,
         panelStatus: lotStatus,
         currentHighMinor: standing ? Number(standing.amount_minor) : null,
         lastBidAt: standing?.last_bid_at ? new Date(standing.last_bid_at) : null,
-        amountMinor: input.amountMinor,
+        expectedAmountMinor: input.expectedAmountMinor,
         now,
         opensAt: config.auction.opensAt,
         closesAt: config.auction.closesAt,
       });
-      if (!decision.ok) return { ok: false as const, decision };
+      if (!decision.ok) return { kind: "rejected" as const, decision };
 
       await tx
         .update(bids)
         .set({ status: "outbid" })
         .where(and(eq(bids.panelId, input.panelId), eq(bids.status, "active")));
 
-      const [inserted] = await tx
+      const [row] = await tx
         .insert(bids)
         .values({
           panelId: input.panelId,
-          amountMinor: input.amountMinor,
+          amountMinor: decision.amountMinor,
           displayName: input.displayName,
           contactName: input.contactName,
           contactEmail: input.contactEmail,
@@ -221,23 +278,28 @@ export class PostgresAuctionRepository implements AuctionRepository {
         })
         .returning();
 
-      if (!inserted) throw new Error("Bid insert returned no row.");
+      if (!row) throw new Error("Bid insert returned no row.");
 
       await tx
         .insert(bidRequests)
-        .values({ idempotencyKey: input.idempotencyKey, bidId: inserted.id });
+        .values({ idempotencyKey: input.idempotencyKey, bidId: row.id });
 
-      const lot: LotState = {
-        panel,
-        status: lotStatus,
-        currentHighMinor: inserted.amountMinor,
-        currentHighDisplayName: inserted.displayName,
-        bidCount: (standing ? 1 : 0) + 1,
-        lastBidAt: inserted.createdAt,
-      };
-
-      return { ok: true as const, bid: toBidRecord(inserted), lot, deduplicated: false };
+      return { kind: "inserted" as const, bid: toBidRecord(row) };
     });
+
+    if (inserted.kind === "rejected") return { ok: false, decision: inserted.decision };
+
+    // Re-read outside the transaction so the caller gets the same lot shape the
+    // board serves, history strip included, without duplicating that SQL here.
+    const lot = await this.getLot(input.panelId);
+    if (!lot) throw new Error("Lot vanished immediately after a successful bid.");
+
+    return {
+      ok: true,
+      bid: inserted.bid,
+      lot,
+      deduplicated: inserted.kind === "replay",
+    };
   }
 
   async listBids(options: ListBidsOptions): Promise<ListBidsPage> {
@@ -268,7 +330,7 @@ export class PostgresAuctionRepository implements AuctionRepository {
     const [updated] = await this.db
       .update(bids)
       .set({ status, decidedAt: new Date() })
-      .where(and(eq(bids.id, bidId), inArray(bids.status, [...LIVE_BID_STATUSES, "outbid"])))
+      .where(and(eq(bids.id, bidId), inArray(bids.status, ["active", "outbid", "accepted"])))
       .returning();
     return updated ? toBidRecord(updated) : undefined;
   }
@@ -278,10 +340,7 @@ export class PostgresAuctionRepository implements AuctionRepository {
     await this.db
       .insert(lots)
       .values({ panelId, status, updatedAt: new Date() })
-      .onConflictDoUpdate({
-        target: lots.panelId,
-        set: { status, updatedAt: new Date() },
-      });
+      .onConflictDoUpdate({ target: lots.panelId, set: { status, updatedAt: new Date() } });
     return this.getLot(panelId);
   }
 

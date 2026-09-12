@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { toMinor } from "@/lib/domain/money";
 
 /**
  * Every byte of untrusted input is parsed here before it reaches the domain.
@@ -47,19 +46,14 @@ export const placeBidSchema = z
     panelId: trimmed(64).min(1),
 
     /**
-     * Accepted in major units because that is what the bidder types. Converted
-     * to integer minor units immediately and never handled as a float again.
+     * The price the bidder was shown, in minor units.
+     *
+     * There is no amount to type: every lot rises by one flat increment, so the
+     * next price is determined. This field exists so the server can reject a
+     * bid whose price moved between render and click, rather than silently
+     * committing the bidder to a number they never saw.
      */
-    amount: z
-      .number()
-      .finite()
-      .positive()
-      .max(1_000_000)
-      // Guards against a float that cannot be represented in minor units, which
-      // would otherwise be silently rounded on the way into the ledger.
-      .refine((v) => Math.abs(v * 100 - Math.round(v * 100)) < 1e-6, {
-        message: "Amount may have at most two decimal places.",
-      }),
+    expectedAmountMinor: z.number().int().positive().max(10_000_000_000),
 
     displayName: noControlCharacters(
       trimmed(60).min(2, "Public name must be at least 2 characters."),
@@ -69,7 +63,20 @@ export const placeBidSchema = z
     ),
     contactEmail: trimmed(254).email().toLowerCase(),
     contactPhone: safeLine(32).optional(),
-    brandUrl: trimmed(512).url().optional().or(z.literal("")),
+    /**
+     * Scheme-restricted on purpose. Zod's `.url()` only checks that `new URL`
+     * parses the value, and it parses "javascript:alert(1)" quite happily — so
+     * a bare `.url()` would let a script URL into stored data that a future
+     * template might render as an href. Only http(s) is a website.
+     */
+    brandUrl: trimmed(512)
+      .url()
+      .refine(
+        (v) => /^https?:\/\//i.test(v),
+        "Enter a web address starting with http:// or https://",
+      )
+      .optional()
+      .or(z.literal("")),
     message: safeParagraph(1_000).optional(),
 
     /** Must be ticked. The site states the terms next to the checkbox. */
@@ -95,10 +102,6 @@ export const placeBidSchema = z
   .strict();
 
 export type PlaceBidPayload = z.infer<typeof placeBidSchema>;
-
-export function payloadToMinor(payload: PlaceBidPayload): number {
-  return toMinor(payload.amount);
-}
 
 /** Empty strings from HTML forms mean "not provided", not "provided as blank". */
 export function optionalText(value: string | undefined): string | null {

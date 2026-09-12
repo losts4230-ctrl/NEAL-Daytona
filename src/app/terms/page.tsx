@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { config } from "@/lib/config";
+import { formatMoney } from "@/lib/domain/money";
 
 export const metadata: Metadata = {
   title: "Bidding terms",
@@ -29,11 +30,12 @@ const CLAUSES: readonly { heading: string; body: readonly string[] }[] = [
     ],
   },
   {
-    heading: "3. How a lot is won",
+    heading: "3. How the price works",
     body: [
-      "Each surface is auctioned independently with its own reserve price. The first bid on a lot may be placed at exactly the reserve; each subsequent bid must exceed the standing bid by the published increment.",
+      "Each surface is auctioned independently. Every lot starts at zero and each accepted bid raises that lot by exactly one increment, so a lot's price is always its number of bids multiplied by the increment. There are no reserve prices and no hidden minimums.",
+      "The price shown on the bid button is the price you are agreeing to. If another bidder is accepted first, your bid is rejected and you are told the new price rather than being committed to it.",
       "A bid placed within five minutes of a lot's scheduled close extends that lot by five minutes from the time of the bid.",
-      "The highest valid bid at close is the leading bid. It becomes a won lot only when the organiser confirms it in writing.",
+      "The highest bid at close is the leading bid. It becomes a won lot only when the organiser confirms it in writing.",
     ],
   },
   {
@@ -69,7 +71,8 @@ const CLAUSES: readonly { heading: string; body: readonly string[] }[] = [
   {
     heading: "8. Data protection",
     body: [
-      "The public name submitted with a bid, the bid amount and the lot are published on the site. Contact name, email address and phone number are private and used only to administer the auction.",
+      "The public name submitted with a bid, the web address given with it, the bid amount and the lot are published on the site, and remain visible in that lot's bid history after the bid is superseded. Contact name, email address and phone number are private and used only to administer the auction.",
+      "Site icons shown next to bidder names are fetched by this website's server, not by other visitors' browsers, so viewing the auction does not disclose the viewer to any third party.",
       "A salted hash of the bidder's IP address is stored for abuse investigation; the address itself is not retained. Personal data is not sold or shared with third parties.",
       "A bidder may request withdrawal of their bid and deletion of their personal data at any time by contacting the organiser.",
     ],
@@ -84,29 +87,29 @@ const CLAUSES: readonly { heading: string; body: readonly string[] }[] = [
 
 export default function TermsPage() {
   return (
-    <div className="shell">
+    <div>
       <header className="masthead">
         <div className="wrap masthead__inner">
           <a className="wordmark" href="/">
-            Brand My <span className="wordmark__slash">/</span> Daytona
-            <span className="wordmark__model">675R</span>
+            Brand my Daytona 675R
           </a>
-          <a className="btn btn--sm masthead__cta" href="/#auction">
-            Back to the auction
-          </a>
+          <nav className="masthead__nav" aria-label="Sections">
+            <a className="btn btn--solid" href="/#auction">
+              Back to the auction
+            </a>
+          </nav>
         </div>
       </header>
 
-      <main className="wrap section" style={{ borderTop: 0 }}>
-        <p className="eyebrow">
-          <span className="eyebrow__index">&sect;</span> Bidding terms
-        </p>
-        <h1 style={{ fontSize: "clamp(1.9rem, 5vw, 3rem)", textTransform: "uppercase" }}>
+      <main className="wrap section">
+        <p className="eyebrow eyebrow--soft">Bidding terms</p>
+        <h1 style={{ fontSize: "clamp(1.9rem, 5vw, 3.25rem)", marginTop: "1rem" }}>
           Terms of bidding
         </h1>
         <p className="lede" style={{ marginTop: "1rem" }}>
           These terms apply to every bid placed on this site. Auction currency is{" "}
-          {config.money.currency}.
+          {config.money.currency}, and the bid increment is{" "}
+          {formatMoney(config.auction.incrementMinor, config.money)}.
         </p>
 
         <div style={{ maxWidth: "68ch", marginTop: "3rem", display: "grid", gap: "2rem" }}>

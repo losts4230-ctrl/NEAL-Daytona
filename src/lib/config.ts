@@ -22,12 +22,30 @@ const schema = z.object({
   AUCTION_CLOSES_AT: z.string().datetime().default("2026-11-30T20:00:00.000Z"),
 
   /** ISO 4217. Drives every price rendered on the site. */
-  CURRENCY: z.string().length(3).default("GBP"),
-  LOCALE: z.string().default("en-GB"),
+  CURRENCY: z.string().length(3).default("INR"),
+  LOCALE: z.string().default("en-IN"),
+
+  /**
+   * Flat bid increment, in major units.
+   *
+   * Every lot starts at zero and each bid raises it by exactly this much, so a
+   * lot's price is always (bid count x increment). Target divided by increment
+   * is the number of bids the whole auction needs, which is the number to
+   * reason about when changing it: lower is more accessible and more gamified
+   * but needs far more bids; higher reaches the target sooner but prices out
+   * small sponsors.
+   */
+  BID_INCREMENT: z.coerce.number().positive().default(5_000),
+
+  /** What the build needs to raise, in major units. Drives the funding bar. */
+  PURCHASE_TARGET: z.coerce.number().positive().default(1_000_000),
 
   /** Sliding-window cap on bid submissions per client, per window. */
   BID_RATE_LIMIT: z.coerce.number().int().positive().default(5),
   BID_RATE_WINDOW_SECONDS: z.coerce.number().int().positive().default(300),
+
+  /** How many recent bids each lot shows publicly. */
+  BID_HISTORY_LENGTH: z.coerce.number().int().min(1).max(20).default(5),
 
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
@@ -84,7 +102,14 @@ function load() {
     dataDriver: env.DATA_DRIVER,
     databaseUrl: env.DATABASE_URL,
     adminApiToken: env.ADMIN_API_TOKEN,
-    auction: { opensAt, closesAt },
+    auction: {
+      opensAt,
+      closesAt,
+      /** Minor units. All arithmetic downstream is integer. */
+      incrementMinor: Math.round(env.BID_INCREMENT * 100),
+      targetMinor: Math.round(env.PURCHASE_TARGET * 100),
+      historyLength: env.BID_HISTORY_LENGTH,
+    },
     money: { currency: env.CURRENCY, locale: env.LOCALE },
     rateLimit: { max: env.BID_RATE_LIMIT, windowSeconds: env.BID_RATE_WINDOW_SECONDS },
     logLevel: env.LOG_LEVEL,

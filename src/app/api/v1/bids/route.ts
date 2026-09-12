@@ -4,7 +4,7 @@ import { clientAddress, clientUserAgent, hashAddress, requestId } from "@/lib/ht
 import { checkRateLimit } from "@/lib/http/rate-limit";
 import { NO_STORE, fail, ok } from "@/lib/http/response";
 import { toPublicBidReceipt, toPublicLot } from "@/lib/http/serialise";
-import { optionalText, payloadToMinor, placeBidSchema } from "@/lib/http/validation";
+import { optionalText, placeBidSchema } from "@/lib/http/validation";
 
 export const dynamic = "force-dynamic";
 
@@ -13,7 +13,7 @@ const CONFLICT_CODES = new Set([
   "AUCTION_NOT_OPEN",
   "AUCTION_CLOSED",
   "PANEL_UNAVAILABLE",
-  "BELOW_MINIMUM",
+  "PRICE_MOVED",
 ]);
 
 /**
@@ -96,7 +96,7 @@ export async function POST(request: Request) {
     const result = await repository.placeBid(
       {
         panelId: payload.panelId,
-        amountMinor: payloadToMinor(payload),
+        expectedAmountMinor: payload.expectedAmountMinor,
         displayName: payload.displayName,
         contactName: payload.contactName,
         contactEmail: payload.contactEmail,
@@ -122,7 +122,11 @@ export async function POST(request: Request) {
         {
           code: result.decision.code,
           message: result.decision.message,
-          details: { minimumBidMinor: result.decision.minimumMinor },
+          /**
+           * Always the live next price. A PRICE_MOVED client can re-render the
+           * button from this without a second round trip.
+           */
+          details: { nextBidMinor: result.decision.nextAmountMinor },
         },
         { headers: NO_STORE },
       );

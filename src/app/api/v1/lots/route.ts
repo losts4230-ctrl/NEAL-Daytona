@@ -1,6 +1,6 @@
 import { config } from "@/lib/config";
-import { extendedCloseAt } from "@/lib/domain/bidding";
-import { TOTAL_RESERVE_MINOR } from "@/lib/domain/panels";
+import { bidIncrement, extendedCloseAt, fundingPercent } from "@/lib/domain/bidding";
+import { TOTAL_AREA_CM2 } from "@/lib/domain/panels";
 import { logger } from "@/lib/logger";
 import { getRepository } from "@/lib/repo";
 import { SHORT_PUBLIC_CACHE, fail, ok } from "@/lib/http/response";
@@ -13,8 +13,9 @@ export const dynamic = "force-dynamic";
 /**
  * GET /api/v1/lots — the public board.
  *
- * One repository call, one database query. This is the most requested endpoint
- * on the site, so it stays free of per-lot follow-up work.
+ * One repository call, two database queries regardless of lot count: one
+ * aggregate and one top-N-per-lot for the history strips. This is the most
+ * requested endpoint on the site, so it stays free of per-lot follow-up work.
  */
 export async function GET(request: Request) {
   const log = logger.child({ requestId: requestId(request.headers), route: "GET /api/v1/lots" });
@@ -31,7 +32,11 @@ export async function GET(request: Request) {
       null,
     );
 
-    const committedMinor = lots.reduce((sum, lot) => sum + (lot.currentHighMinor ?? 0), 0);
+    /**
+     * Raised is the sum of the leading bids, not of every bid ever placed: an
+     * outbid bid is never invoiced, so counting it would overstate funding.
+     */
+    const raisedMinor = lots.reduce((sum, lot) => sum + (lot.currentHighMinor ?? 0), 0);
 
     log.info("Served auction board", {
       durationMs: Date.now() - startedAt,
@@ -48,11 +53,16 @@ export async function GET(request: Request) {
           effectiveClosesAt: extendedCloseAt(config.auction.closesAt, latestBidAt).toISOString(),
           currency: config.money.currency,
           locale: config.money.locale,
+          incrementMinor: bidIncrement(),
+        },
+        funding: {
+          raisedMinor,
+          targetMinor: config.auction.targetMinor,
+          percent: Math.round(fundingPercent(raisedMinor, config.auction.targetMinor)),
         },
         totals: {
           lotCount: publicLots.length,
-          totalReserveMinor: TOTAL_RESERVE_MINOR,
-          committedMinor,
+          totalAreaCm2: TOTAL_AREA_CM2,
           bidCount: lots.reduce((sum, lot) => sum + lot.bidCount, 0),
         },
         /** Surfaced so the UI can warn when bids are not durable. */

@@ -1,13 +1,18 @@
 # Brand My Daytona
 
 A sponsorship auction for branding space on a Triumph Daytona 675R race build.
-Every panel on the bike is a separate lot with its own reserve price, print area
-and bid history. The bike has not been bought yet — the auction is what funds it.
+Eleven surfaces, each its own auction. **Every lot starts at zero and each bid
+raises it by a flat ₹5,000**, so a lot's price is always its bid count times the
+increment. The bike has not been bought yet — the auction is what funds the
+₹10,00,000 purchase target, and a funding bar in the hero says so.
 
-- **Public board** — interactive side elevation of the bike; tap a surface to
-  jump to its lots. Live leading bids, per-lot minimums, countdown.
-- **Bidding** — server-authoritative, race-safe, idempotent. Bids are
-  non-binding offers; no payment details are ever collected.
+- **Public board** — interactive side elevation; tap a surface to jump to its
+  lot. Live leader, full bid history per lot, funding bar, countdown.
+- **Bidding** — no amount to type: you accept the next price or you do not.
+  Server-authoritative, race-safe, idempotent. Bids are non-binding offers and
+  no payment details are ever collected.
+- **Bidder identity** — the icon of the site a bidder gives, proxied through
+  this origin so no visitor is disclosed to a third-party favicon service.
 - **Operator console** — `/admin`, accept or reject bids, open and close lots.
 
 Run it with no database at all:
@@ -28,7 +33,7 @@ That uses the in-memory store, which is fine for development and demos and is
 |---|---|
 | `npm run dev` | Dev server with hot reload |
 | `npm run verify` | Typecheck, unit tests, production build. Run before pushing |
-| `npm test` | Unit tests (56 tests) |
+| `npm test` | Unit tests (70 tests) |
 | `npm run build` / `npm start` | Production build and server |
 | `npm run db:migrate` | Apply `drizzle/` migrations to `DATABASE_URL` |
 | `npm run db:seed` | Create a `lots` row per catalogue entry (idempotent) |
@@ -45,7 +50,9 @@ there. The ones that matter:
 | `ADMIN_API_TOKEN` | 32+ chars. `openssl rand -base64 48`. Admin API fails closed without it |
 | `IP_HASH_SALT` | `openssl rand -hex 32`. Set explicitly in production |
 | `AUCTION_OPENS_AT` / `AUCTION_CLOSES_AT` | ISO 8601 **with timezone** |
-| `CURRENCY` / `LOCALE` | `GBP` / `en-GB` by default |
+| `CURRENCY` / `LOCALE` | `INR` / `en-IN` by default |
+| `BID_INCREMENT` | The flat step, in major units. Default `5000` |
+| `PURCHASE_TARGET` | What the build needs to raise. Default `1000000` |
 
 Configuration is validated once at import. A malformed value fails the build; a
 missing secret fails the dependent feature closed and is reported in the
@@ -59,28 +66,39 @@ Everything you are likely to want to change is in one of four places.
 
 **1. The lots — `src/lib/domain/panels.ts`**
 
-The catalogue is code, not database rows, so repricing a lot is a reviewable
-one-line diff. Each entry has a name, location, tier, print area and reserve.
+The catalogue is code, not database rows, so changing it is a reviewable diff.
+Each entry has a name, a one-line descriptor, a print area and a sort order.
+There are no per-lot prices: **the order is the pricing signal**, since every
+lot starts at zero and the market decides the rest. Position 01 should be the
+panel the camera cannot avoid.
 
 > Lot `id` values are the business key: they appear in the database, in URLs and
 > in the SVG diagram. **Never rename an id once bids exist against it.** Adding
 > and removing lots is safe.
 
-**2. The bike diagram — `src/components/bike-diagram.tsx`**
+**2. The bike drawing — `src/components/bike-geometry.ts`**
 
 A hand-drawn SVG side elevation. The file opens with the full coordinate system
 (axle positions, wheel radius, ground line) and the shared outline vertices. If
-you add a lot, add a zone with its `panelIds` and a path that tiles into the
-existing silhouette.
+you add a lot, add a zone with its `panelIds`, a path that tiles into the
+existing silhouette, and a `focus` view box (400×250) centred on it — that box
+is what crops the thumbnail on the lot row.
+
+Geometry lives here, separate from the components, so the big diagram and the
+small thumbnails cannot drift apart.
 
 **3. Copy, spec and FAQ — `src/app/page.tsx`**
 
 The `SPEC`, `STEPS` and `FAQ` constants near the top of the file.
 
-**4. Currency — `CURRENCY` / `LOCALE`**
+**4. Money — `CURRENCY`, `LOCALE`, `BID_INCREMENT`, `PURCHASE_TARGET`**
 
-Changing currency does **not** convert the reserves in `panels.ts`; they are
-plain numbers. Review them when you switch.
+`PURCHASE_TARGET / BID_INCREMENT` is how many bids the auction needs to hit
+target: 200 at the defaults. That ratio is the thing to reason about — a smaller
+increment is more accessible and more gamified but needs far more bids, a larger
+one reaches target sooner but prices out small sponsors.
+
+Changing `CURRENCY` does **not** convert either figure; they are plain numbers.
 
 ### Copy that needs your real details before launch
 
@@ -106,30 +124,37 @@ Versioned under `/api/v1`. Every response is `{ data }` or
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `GET` | `/api/v1/lots` | public | Full board: lots, auction window, totals |
-| `POST` | `/api/v1/bids` | public | Place a bid |
+| `GET` | `/api/v1/lots` | public | Full board: lots, history, funding, window |
+| `POST` | `/api/v1/bids` | public | Place a bid at the lot's next price |
+| `GET` | `/api/v1/brand-icon?domain=` | public | A bidder's site icon, or a generated monogram |
 | `GET` | `/api/v1/admin/bids` | bearer | All bids including bidder contact details |
 | `PATCH` | `/api/v1/admin/bids/:id` | bearer | `{"status":"accepted"\|"rejected"}` |
 | `PATCH` | `/api/v1/admin/lots/:panelId` | bearer | `{"status":"open"\|"reserved"\|"sold"\|"withdrawn"}` |
 | `GET` | `/api/health` | public | Liveness, readiness, config warnings |
 
-Bid rejection codes: `BELOW_MINIMUM`, `AUCTION_NOT_OPEN`, `AUCTION_CLOSED`,
+Bid rejection codes: `PRICE_MOVED`, `AUCTION_NOT_OPEN`, `AUCTION_CLOSED`,
 `PANEL_UNAVAILABLE` (all HTTP 409), `VALIDATION_FAILED`, `UNKNOWN_PANEL`
-(HTTP 400), `RATE_LIMITED` (429).
+(HTTP 400), `RATE_LIMITED` (429). A `PRICE_MOVED` response carries the live
+`nextBidMinor`, so a client can re-offer without a second round trip.
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/bids \
   -H 'content-type: application/json' \
   -d '{
     "panelId": "upper-fairing-left",
-    "amount": 900,
-    "displayName": "Apex Coffee Co",
+    "expectedAmountMinor": 500000,
+    "displayName": "Apex Coffee Roasters",
+    "brandUrl": "https://apexcoffee.in",
     "contactName": "Sam Reed",
     "contactEmail": "sam@example.com",
     "acceptedTerms": true,
     "idempotencyKey": "a-unique-key-per-attempt"
   }'
 ```
+
+`expectedAmountMinor` is the price the bidder was shown, in minor units — **not
+a price they choose**. The server recomputes the real next price and rejects a
+mismatch, so the amount written to the ledger is always the server's.
 
 `idempotencyKey` is required: a retry with the same key returns the original bid
 (HTTP 200) instead of creating a second one.
@@ -190,15 +215,18 @@ Next.js 15, React 19, TypeScript strict, Drizzle + Postgres, Zod, Vitest. Plain
 CSS with design tokens — no UI framework, no web fonts, so nothing third-party
 sits on the critical path or in the CSP.
 
-Three invariants worth knowing before you change anything:
+Four invariants worth knowing before you change anything:
 
 1. **Bidding rules live only in `domain/bidding.ts`.** A handler that re-checks a
    threshold creates a second source of truth that will diverge.
 2. **`evaluateBid` is called inside the repository's write transaction**, after a
    `SELECT ... FOR UPDATE` on the lot. That lock is what stops two bidders on one
    lot both being told they won. Never validate then write as separate steps.
-3. **Money is always integer minor units.** Never a float, never a string until
-   it reaches `formatMoney`.
+3. **The bid amount is the server's.** A client sends the price it saw, never a
+   price it wants. `placeBid` writes `decision.amountMinor`, nothing else.
+4. **Money is always integer minor units.** Never a float, never a string until
+   it reaches `formatMoney` — and never `Intl` compact notation in
+   server-rendered output (see `formatMoneyCompact` for why).
 
 `docs/ARCHITECTURE.md` also records what was deliberately left out and what a
 reviewer should push back on.

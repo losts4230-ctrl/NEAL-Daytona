@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { formatMoney, toMajor } from "@/lib/domain/money";
+import { useEffect, useId, useRef, useState } from "react";
+import { formatMoney } from "@/lib/domain/money";
 import type { PublicBidReceipt, PublicLot } from "@/lib/http/serialise";
 
 interface BidDialogProps {
@@ -12,9 +12,7 @@ interface BidDialogProps {
   onPlaced: (lot: PublicLot, receipt: PublicBidReceipt) => void;
 }
 
-interface FieldErrors {
-  [field: string]: string | undefined;
-}
+type FieldErrors = Record<string, string | undefined>;
 
 interface ApiErrorBody {
   error?: { code?: string; message?: string; details?: unknown };
@@ -39,9 +37,30 @@ function toFieldErrors(details: unknown): FieldErrors {
   return errors;
 }
 
+/** A rejected bid reports the live next price so the form can re-offer it. */
+function movedPrice(details: unknown): number | null {
+  if (details && typeof details === "object" && "nextBidMinor" in details) {
+    const next = (details as { nextBidMinor: unknown }).nextBidMinor;
+    if (typeof next === "number" && Number.isFinite(next)) return next;
+  }
+  return null;
+}
+
+/**
+ * Confirm-a-price dialog rather than an amount form.
+ *
+ * There is no number to type: every lot rises by one flat increment, so the
+ * price is determined and the bidder's only decision is whether to take it.
+ * That removes the single worst failure mode of a free-entry auction form —
+ * an accidental extra zero — and it is why the price is stated as a fact at
+ * the top instead of being asked for.
+ *
+ * The price the bidder saw is sent with the bid. If someone got there first the
+ * server answers PRICE_MOVED with the live price, and the dialog re-offers at
+ * the new number rather than silently committing them to it.
+ */
 export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const formRef = useRef<HTMLFormElement>(null);
   const baseId = useId();
 
   const [submitting, setSubmitting] = useState(false);
@@ -49,19 +68,17 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [receipt, setReceipt] = useState<PublicBidReceipt | null>(null);
 
+  /** The price on offer in this dialog. Re-offered higher after a PRICE_MOVED. */
+  const [priceMinor, setPriceMinor] = useState(0);
+
   /**
    * One key per attempt-series. A retry after a network timeout reuses it, so a
    * bid that actually landed is returned rather than duplicated; a fresh bid
-   * gets a fresh key because the dialog remounts the value on open.
+   * gets a fresh key because the dialog regenerates it on open.
    */
   const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID());
 
-  const minimum = lot?.minimumBidMinor ?? 0;
-
-  const money = useMemo(
-    () => (minor: number) => formatMoney(minor, { currency, locale }),
-    [currency, locale],
-  );
+  const money = (minor: number) => formatMoney(minor, { currency, locale });
 
   // Drive the native dialog from the `lot` prop so Escape, focus trapping and
   // the top layer come from the platform rather than a hand-rolled modal.
@@ -73,6 +90,7 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
       setFormError(null);
       setFieldErrors({});
       setReceipt(null);
+      setPriceMinor(lot.nextBidMinor);
       setIdempotencyKey(crypto.randomUUID());
       dialog.showModal();
     } else if (!lot && dialog.open) {
@@ -93,20 +111,6 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
     if (!lot || submitting) return;
 
     const form = new FormData(event.currentTarget);
-    const amountRaw = String(form.get("amount") ?? "").trim();
-    const amount = Number(amountRaw);
-
-    // Client-side pre-check for instant feedback only. The server re-evaluates
-    // every rule against the live standing bid; this is never the authority.
-    if (!Number.isFinite(amount) || amount <= 0) {
-      setFieldErrors({ amount: "Enter a bid amount." });
-      return;
-    }
-    if (Math.round(amount * 100) < minimum) {
-      setFieldErrors({ amount: `Minimum bid for this lot is ${money(minimum)}.` });
-      return;
-    }
-
     setSubmitting(true);
     setFormError(null);
     setFieldErrors({});
@@ -117,7 +121,7 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           panelId: lot.id,
-          amount,
+          expectedAmountMinor: priceMinor,
           displayName: String(form.get("displayName") ?? "").trim(),
           contactName: String(form.get("contactName") ?? "").trim(),
           contactEmail: String(form.get("contactEmail") ?? "").trim(),
@@ -137,12 +141,24 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
       if (!response.ok) {
         const error = (body as ApiErrorBody).error;
         setFieldErrors(toFieldErrors(error?.details));
+
+        const next = movedPrice(error?.details);
+        if (error?.code === "PRICE_MOVED" && next !== null) {
+          // Re-offer at the live price, and take a new idempotency key: this is
+          // now a different bid, not a retry of the one that was rejected.
+          setPriceMinor(next);
+          setIdempotencyKey(crypto.randomUUID());
+          setFormError(`Someone bid first. The price is now ${money(next)} — bid again to take it.`);
+          return;
+        }
+
         setFormError(error?.message ?? "That bid could not be placed.");
         return;
       }
 
-      const { bid, lot: updatedLot } = (body as { data: { bid: PublicBidReceipt; lot: PublicLot } })
-        .data;
+      const { bid, lot: updatedLot } = (
+        body as { data: { bid: PublicBidReceipt; lot: PublicLot } }
+      ).data;
       setReceipt(bid);
       onPlaced(updatedLot, bid);
     } catch {
@@ -160,8 +176,8 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
         <>
           <div className="dialog__head">
             <div>
-              <p className="dialog__eyebrow">
-                {lot.tierLabel} lot &middot; {lot.areaCm2} cm&sup2;
+              <p className="eyebrow eyebrow--soft">
+                {lot.areaCm2} cm&sup2;{lot.bothSides ? " · both sides" : ""}
               </p>
               <h2 className="dialog__title" id={`${baseId}-title`}>
                 {lot.name}
@@ -183,20 +199,20 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
                 <div className="success__mark" aria-hidden="true">
                   &#10003;
                 </div>
-                <h3 className="success__title">Bid recorded</h3>
+                <h3 className="success__title">You are the leading bidder</h3>
                 <p className="success__body">
                   {money(receipt.amountMinor)} on {lot.name}, under the name{" "}
                   <strong>{receipt.displayName}</strong>.
                 </p>
                 <p className="success__body">
-                  Your bid reference is <span className="num">{receipt.id.slice(0, 8)}</span>. It is
-                  an offer, not a payment &mdash; nothing is charged now, and you will be contacted
-                  by email if it wins.
+                  Reference <span className="num">{receipt.id.slice(0, 8)}</span>. This is an offer,
+                  not a payment &mdash; nothing has been charged, and you will be contacted by
+                  email if it wins.
                 </p>
                 <div className="dialog__foot">
                   <button
                     type="button"
-                    className="btn btn--primary btn--block"
+                    className="btn btn--solid btn--block btn--lg"
                     onClick={() => dialogRef.current?.close()}
                   >
                     Done
@@ -204,41 +220,15 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
                 </div>
               </div>
             ) : (
-              <form ref={formRef} onSubmit={handleSubmit} noValidate>
-                <div className="dialog__summary">
-                  <div>
-                    <p className="metric__label">Current high</p>
-                    <p className="metric__value num">
-                      {lot.currentHighMinor === null ? "No bids" : money(lot.currentHighMinor)}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="metric__label">Minimum bid</p>
-                    <p className="metric__value metric__value--ember num">{money(minimum)}</p>
-                  </div>
-                </div>
-
-                <div className="field">
-                  <label className="field__label" htmlFor={`${baseId}-amount`}>
-                    Your bid ({currency}) <span className="field__req">*</span>
-                  </label>
-                  <input
-                    id={`${baseId}-amount`}
-                    name="amount"
-                    className="input input--amount"
-                    type="number"
-                    inputMode="decimal"
-                    min={toMajor(minimum)}
-                    step="1"
-                    defaultValue={toMajor(minimum)}
-                    required
-                    aria-invalid={fieldErrors.amount ? "true" : undefined}
-                    aria-describedby={`${baseId}-amount-hint`}
-                  />
-                  <p className="field__hint" id={`${baseId}-amount-hint`}>
-                    Minimum {money(minimum)}. Whole {currency} only.
+              <form onSubmit={handleSubmit} noValidate>
+                <div className="pricebox">
+                  <p className="pricebox__label">Your bid</p>
+                  <p className="pricebox__value">{money(priceMinor)}</p>
+                  <p className="pricebox__note">
+                    {lot.currentHighMinor === null
+                      ? "This lot has no bids. The first bid takes it."
+                      : `Beats the current ${money(lot.currentHighMinor)} by one increment.`}
                   </p>
-                  {fieldErrors.amount ? <p className="field__error">{fieldErrors.amount}</p> : null}
                 </div>
 
                 <div className="field">
@@ -255,12 +245,29 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
                     placeholder="Your brand, as it should appear on the board"
                     aria-invalid={fieldErrors.displayName ? "true" : undefined}
                   />
-                  <p className="field__hint">
-                    Shown publicly next to the leading bid. Use a nickname if you would rather stay
-                    anonymous.
-                  </p>
                   {fieldErrors.displayName ? (
                     <p className="field__error">{fieldErrors.displayName}</p>
+                  ) : null}
+                </div>
+
+                <div className="field">
+                  <label className="field__label" htmlFor={`${baseId}-url`}>
+                    Website
+                  </label>
+                  <input
+                    id={`${baseId}-url`}
+                    name="brandUrl"
+                    className="input"
+                    type="url"
+                    placeholder="https://"
+                    maxLength={512}
+                    aria-invalid={fieldErrors.brandUrl ? "true" : undefined}
+                  />
+                  <p className="field__hint">
+                    Optional, but your site&apos;s icon appears next to your name on the board.
+                  </p>
+                  {fieldErrors.brandUrl ? (
+                    <p className="field__error">{fieldErrors.brandUrl}</p>
                   ) : null}
                 </div>
 
@@ -306,7 +313,7 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
                 <div className="field field--grid">
                   <div>
                     <label className="field__label" htmlFor={`${baseId}-phone`}>
-                      Phone (optional)
+                      Phone
                     </label>
                     <input
                       id={`${baseId}-phone`}
@@ -318,41 +325,30 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
                     />
                   </div>
                   <div>
-                    <label className="field__label" htmlFor={`${baseId}-url`}>
-                      Website (optional)
+                    <label className="field__label" htmlFor={`${baseId}-message`}>
+                      Artwork notes
                     </label>
                     <input
-                      id={`${baseId}-url`}
-                      name="brandUrl"
+                      id={`${baseId}-message`}
+                      name="message"
                       className="input"
-                      type="url"
-                      placeholder="https://"
-                      maxLength={512}
-                      aria-invalid={fieldErrors.brandUrl ? "true" : undefined}
+                      type="text"
+                      maxLength={1000}
+                      placeholder="Logo format, colours"
                     />
-                    {fieldErrors.brandUrl ? (
-                      <p className="field__error">{fieldErrors.brandUrl}</p>
-                    ) : null}
                   </div>
-                </div>
-
-                <div className="field">
-                  <label className="field__label" htmlFor={`${baseId}-message`}>
-                    Artwork notes (optional)
-                  </label>
-                  <textarea
-                    id={`${baseId}-message`}
-                    name="message"
-                    className="textarea"
-                    maxLength={1000}
-                    placeholder="Anything I should know about your logo, colours or artwork format."
-                  />
                 </div>
 
                 {/* Honeypot: off-screen, unlabelled, never focusable by a human. */}
                 <div className="honeypot" aria-hidden="true">
                   <label htmlFor={`${baseId}-website`}>Leave this empty</label>
-                  <input id={`${baseId}-website`} name="website" type="text" tabIndex={-1} autoComplete="off" />
+                  <input
+                    id={`${baseId}-website`}
+                    name="website"
+                    type="text"
+                    tabIndex={-1}
+                    autoComplete="off"
+                  />
                 </div>
 
                 <div className="field">
@@ -375,8 +371,12 @@ export function BidDialog({ lot, currency, locale, onClose, onPlaced }: BidDialo
                       {formError}
                     </p>
                   ) : null}
-                  <button type="submit" className="btn btn--primary btn--block" disabled={submitting}>
-                    {submitting ? "Placing bid..." : `Place bid on ${lot.name}`}
+                  <button
+                    type="submit"
+                    className="btn btn--solid btn--block btn--lg"
+                    disabled={submitting}
+                  >
+                    {submitting ? "Placing bid…" : `Bid ${money(priceMinor)}`}
                   </button>
                 </div>
               </form>
